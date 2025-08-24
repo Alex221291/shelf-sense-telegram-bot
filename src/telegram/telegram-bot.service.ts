@@ -114,9 +114,9 @@ export class TelegramBotService implements OnModuleInit {
           const currentUserState = currentChatId ? this.userStates.get(currentChatId) : null;
           
           if (currentUserState === 'price_tags') {
-            await this.onPriceSummary(ctx);
+            await this.showPriceSummaryInline(ctx);
           } else {
-            await this.onShelfSummary(ctx);
+            await this.showShelfSummaryInline(ctx);
           }
           break;
         case '🔍 Выбрать группу':
@@ -308,6 +308,33 @@ ${summary.top_groups.map((group, index) => `${index + 1}. ${group}`).join('\n')}
     }
   }
 
+  // Статистика по выкладке (без перехода в подменю)
+  private async showShelfSummaryInline(ctx: Context) {
+    const chatId = ctx.chat?.id;
+    if (chatId) {
+      console.log(`[${chatId}] Пользователь просматривает статистику по выкладке (inline)`);
+    }
+
+    try {
+      const summary = await this.shelfSenseService.getShelfSummary();
+      
+      const message = `
+📊 **Статистика по магазину:**
+
+🪑 **Стеллажей с пустотами:** ${summary.shelves_with_voids} (${summary.voids_percent.toFixed(1)}%)
+📦 **Артикулов к выкладке:** ${summary.skus_to_fill}
+🆕 **Новых пустот:** ${summary.new_voids}
+
+🏆 **TOP-5 товарных групп к выкладке:**
+${summary.top_groups.map((group, index) => `${index + 1}. ${group}`).join('\n')}
+      `;
+
+      await ctx.reply(message, { parse_mode: 'Markdown' });
+    } catch (error) {
+      await ctx.reply('❌ Ошибка при получении статистики по выкладке');
+    }
+  }
+
   // Статистика по ценникам
   private async onPriceSummary(ctx: Context) {
     const chatId = ctx.chat?.id;
@@ -344,6 +371,35 @@ ${summary.top_groups.map((group, index) => `${index + 1}. ${group}`).join('\n')}
       };
 
       await ctx.reply(message, { reply_markup: keyboard });
+    } catch (error) {
+      await ctx.reply('❌ Ошибка при получении статистики по ценникам');
+    }
+  }
+
+  // Статистика по ценникам (без перехода в подменю)
+  private async showPriceSummaryInline(ctx: Context) {
+    const chatId = ctx.chat?.id;
+    if (chatId) {
+      console.log(`[${chatId}] Пользователь просматривает статистику по ценникам (inline)`);
+    }
+
+    try {
+      const summary = await this.shelfSenseService.getPriceSummary();
+      
+      const message = `
+📊 **Статистика по магазину:**
+
+🪑 **Стеллажей с ошибками:** ${summary.shelves_with_errors} (${summary.errors_percent.toFixed(1)}%)
+💰 **Некорректная цена:** ${summary.price_mismatch}
+📋 **Некорректный макет:** ${summary.tag_template_mismatch}
+❌ **Отсутствует:** ${summary.tags_missing}
+➕ **Лишний:** ${summary.tags_extra}
+
+🏆 **TOP-5 товарных групп к исправлению:**
+${summary.top_groups.map((group, index) => `${index + 1}. ${group}`).join('\n')}
+      `;
+
+      await ctx.reply(message, { parse_mode: 'Markdown' });
     } catch (error) {
       await ctx.reply('❌ Ошибка при получении статистики по ценникам');
     }
