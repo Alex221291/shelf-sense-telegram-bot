@@ -5,11 +5,18 @@ import { ReplyKeyboardMarkup, InlineKeyboardMarkup } from 'telegraf/typings/core
 import { ShelfSenseService } from '../services/shelf-sense.service';
 import { TaskActionTypes } from '../types/shelf-sense.types';
 
+// Интерфейс для состояния навигации пользователя
+interface UserNavigationState {
+  currentPage: string;
+  navigationStack: string[];
+  contextData?: any; // Дополнительные данные для восстановления контекста
+}
+
 @Injectable()
 export class TelegramBotService implements OnModuleInit {
   private bot: Telegraf<Context>;
-  private userStates: Map<number, string> = new Map(); // Простая система состояний пользователей
-  private userHistory: Map<number, string[]> = new Map(); // История навигации пользователей
+  private userStates: Map<number, string> = new Map(); // Состояния пользователей
+  private userNavigation: Map<number, UserNavigationState> = new Map(); // Навигация пользователей
 
   // Переводы типов ошибок для пользователей
   private getErrorTypeDisplayName(errorType: string): string {
@@ -53,13 +60,110 @@ export class TelegramBotService implements OnModuleInit {
     console.log('🤖 Telegram Bot запущен');
   }
 
+  // Инициализация навигации для пользователя
+  private initUserNavigation(chatId: number): UserNavigationState {
+    const navigation: UserNavigationState = {
+      currentPage: 'main',
+      navigationStack: [] // Начинаем с пустого стека
+    };
+    this.userNavigation.set(chatId, navigation);
+    return navigation;
+  }
+
+  // Получение навигации пользователя
+  private getUserNavigation(chatId: number): UserNavigationState {
+    if (!this.userNavigation.has(chatId)) {
+      return this.initUserNavigation(chatId);
+    }
+    return this.userNavigation.get(chatId)!;
+  }
+
+  // Переход на страницу с сохранением в истории
+  private navigateTo(chatId: number, page: string, contextData?: any) {
+    const navigation = this.getUserNavigation(chatId);
+    
+    // Проверяем, не добавляем ли мы ту же страницу дважды подряд
+    if (navigation.currentPage === page) {
+      console.log(`[${chatId}] Попытка добавить ту же страницу "${page}" - пропускаем`);
+      return;
+    }
+    
+    // Добавляем текущую страницу в стек навигации (если это не первая страница)
+    if (navigation.currentPage !== 'main' || navigation.navigationStack.length > 0) {
+      navigation.navigationStack.push(navigation.currentPage);
+    }
+    
+    // Ограничиваем стек последними 20 страницами
+    if (navigation.navigationStack.length > 20) {
+      navigation.navigationStack.shift();
+    }
+    
+    // Обновляем текущую страницу
+    navigation.currentPage = page;
+    
+    // Сохраняем контекстные данные
+    if (contextData) {
+      navigation.contextData = contextData;
+    }
+    
+    console.log(`[${chatId}] Навигация: ${navigation.navigationStack.join(' → ')} → ${page}`);
+  }
+
+  // Возврат на предыдущую страницу
+  private goBack(chatId: number): string | null {
+    const navigation = this.getUserNavigation(chatId);
+    
+    if (navigation.navigationStack.length === 0) {
+      return null;
+    }
+    
+    // Получаем предыдущую страницу
+    const previousPage = navigation.navigationStack.pop()!;
+    
+    // Обновляем текущую страницу
+    navigation.currentPage = previousPage;
+    
+    console.log(`[${chatId}] Возврат на: ${previousPage}`);
+    return previousPage;
+  }
+
+  // Получение предыдущей страницы без изменения стека
+  private getPreviousPage(chatId: number): string | null {
+    const navigation = this.getUserNavigation(chatId);
+    
+    if (navigation.navigationStack.length === 0) {
+      return null;
+    }
+    
+    return navigation.navigationStack[navigation.navigationStack.length - 1];
+  }
+
+  // Проверка, можно ли вернуться на страницу
+  private canGoBackTo(chatId: number, page: string): boolean {
+    const navigation = this.getUserNavigation(chatId);
+    return navigation.navigationStack.includes(page);
+  }
+
+  // Умный возврат - определяет, куда лучше вернуться
+  private getSmartPreviousPage(chatId: number): string | null {
+    const navigation = this.getUserNavigation(chatId);
+    
+    if (navigation.navigationStack.length === 0) {
+      return null;
+    }
+    
+    // Просто возвращаем последнюю страницу из стека
+    // Это обеспечит пошаговый возврат назад
+    return navigation.navigationStack[navigation.navigationStack.length - 1];
+  }
+
   private setupCommands() {
     // Команда /start
     this.bot.start(async (ctx) => {
       const chatId = ctx.chat?.id;
       if (chatId) {
         console.log(`[${chatId}] Новый пользователь запустил бота`);
-        this.addToHistory(chatId, 'main');
+        this.initUserNavigation(chatId);
       }
 
       const welcomeMessage = `
@@ -89,6 +193,9 @@ export class TelegramBotService implements OnModuleInit {
       const text = ctx.message?.text;
       if (!text) return;
 
+      const chatId = ctx.chat?.id;
+      if (!chatId) return;
+
       switch (text) {
         case '🏷️ Выкладка товара':
           await this.onShelfManagement(ctx);
@@ -97,7 +204,7 @@ export class TelegramBotService implements OnModuleInit {
           await this.onPriceTags(ctx);
           break;
         case '📚 Помощь':
-          await this.onHelp(ctx);
+          await this.showHelpInline(ctx);
           break;
         case '🔄 Обновить меню':
           await this.onRefreshMenu(ctx);
@@ -109,11 +216,9 @@ export class TelegramBotService implements OnModuleInit {
           await this.onBack(ctx);
           break;
         case '📊 Статистика':
-          // Определяем контекст по состоянию пользователя
-          const currentChatId = ctx.chat?.id;
-          const currentUserState = currentChatId ? this.userStates.get(currentChatId) : null;
-          
-          if (currentUserState === 'price_tags') {
+          // Определяем контекст по текущей странице
+          const navigation = this.getUserNavigation(chatId);
+          if (navigation.currentPage === 'price_tags') {
             await this.showPriceSummaryInline(ctx);
           } else {
             await this.showShelfSummaryInline(ctx);
@@ -121,17 +226,10 @@ export class TelegramBotService implements OnModuleInit {
           break;
         case '🔍 Выбрать группу':
           // Определяем контекст для выбора группы
-          const groupChatId = ctx.chat?.id;
-          const groupUserState = groupChatId ? this.userStates.get(groupChatId) : null;
-          
-          if (groupUserState === 'price_tags') {
-            // Если мы в меню ценников, устанавливаем специальное состояние
-            if (groupChatId) {
-              this.userStates.set(groupChatId, 'selecting_price_group');
-            }
+          const currentNavigation = this.getUserNavigation(chatId);
+          if (currentNavigation.currentPage === 'price_tags') {
             await this.onSelectPriceGroup(ctx);
           } else {
-            // Если мы в меню выкладки товара
             await this.onSelectGroup(ctx);
           }
           break;
@@ -152,8 +250,7 @@ export class TelegramBotService implements OnModuleInit {
           break;
         default:
           // Проверяем состояние пользователя для обработки выбора групп/ошибок
-          const chatId = ctx.chat?.id;
-          const userState = chatId ? this.userStates.get(chatId) : null;
+          const userState = this.userStates.get(chatId);
           
           console.log(`[${chatId}] Обработка текста "${text}" в состоянии: ${userState}`);
           
@@ -202,22 +299,24 @@ export class TelegramBotService implements OnModuleInit {
     const chatId = ctx.chat?.id;
     if (chatId) {
       this.userStates.set(chatId, 'shelf_management');
+      this.navigateTo(chatId, 'shelf_management');
       console.log(`[${chatId}] Пользователь перешел в меню выкладки товара`);
     }
     
-    await this.showShelfManagementMenu(ctx, true);
+    await this.showShelfManagementMenu(ctx);
   }
 
-  // Показать меню выкладки товара (с опцией добавления в историю)
-  private async showShelfManagementMenu(ctx: Context, addToHistory: boolean = true) {
+  // Показать меню выкладки товара
+  private async showShelfManagementMenu(ctx: Context) {
     const chatId = ctx.chat?.id;
-    if (chatId && addToHistory) {
-      this.userStates.set(chatId, 'shelf_management');
-      this.addToHistory(chatId, 'shelf_management');
-      console.log(`[${chatId}] Пользователь перешел в меню выкладки товара`);
-    } else if (chatId) {
-      this.userStates.set(chatId, 'shelf_management');
-      console.log(`[${chatId}] Возврат в меню выкладки товара`);
+    if (chatId) {
+      // Проверяем, не находимся ли мы уже на этой странице
+      const currentNavigation = this.getUserNavigation(chatId);
+      if (currentNavigation.currentPage !== 'shelf_management') {
+        this.userStates.set(chatId, 'shelf_management');
+        this.navigateTo(chatId, 'shelf_management');
+      }
+      console.log(`[${chatId}] Показано меню выкладки товара`);
     }
     
     const keyboard: ReplyKeyboardMarkup = {
@@ -238,22 +337,24 @@ export class TelegramBotService implements OnModuleInit {
     const chatId = ctx.chat?.id;
     if (chatId) {
       this.userStates.set(chatId, 'price_tags');
+      this.navigateTo(chatId, 'price_tags');
       console.log(`[${chatId}] Пользователь перешел в меню ценников`);
     }
     
-    await this.showPriceTagsMenu(ctx, true);
+    await this.showPriceTagsMenu(ctx);
   }
 
-  // Показать меню ценников (с опцией добавления в историю)
-  private async showPriceTagsMenu(ctx: Context, addToHistory: boolean = true) {
+  // Показать меню ценников
+  private async showPriceTagsMenu(ctx: Context) {
     const chatId = ctx.chat?.id;
-    if (chatId && addToHistory) {
-      this.userStates.set(chatId, 'price_tags');
-      this.addToHistory(chatId, 'price_tags');
-      console.log(`[${chatId}] Пользователь перешел в меню ценников`);
-    } else if (chatId) {
-      this.userStates.set(chatId, 'price_tags');
-      console.log(`[${chatId}] Возврат в меню ценников`);
+    if (chatId) {
+      // Проверяем, не находимся ли мы уже на этой странице
+      const currentNavigation = this.getUserNavigation(chatId);
+      if (currentNavigation.currentPage !== 'price_tags') {
+        this.userStates.set(chatId, 'price_tags');
+        this.navigateTo(chatId, 'price_tags');
+      }
+      console.log(`[${chatId}] Показано меню ценников`);
     }
     
     const keyboard: ReplyKeyboardMarkup = {
@@ -275,7 +376,7 @@ export class TelegramBotService implements OnModuleInit {
   private async onShelfSummary(ctx: Context) {
     const chatId = ctx.chat?.id;
     if (chatId) {
-      this.addToHistory(chatId, 'shelf_summary');
+      this.navigateTo(chatId, 'shelf_summary');
       console.log(`[${chatId}] Пользователь просматривает статистику по выкладке`);
     }
 
@@ -339,7 +440,7 @@ ${summary.top_groups.map((group, index) => `${index + 1}. ${group}`).join('\n')}
   private async onPriceSummary(ctx: Context) {
     const chatId = ctx.chat?.id;
     if (chatId) {
-      this.addToHistory(chatId, 'price_summary');
+      this.navigateTo(chatId, 'price_summary');
       console.log(`[${chatId}] Пользователь просматривает статистику по ценникам`);
     }
 
@@ -409,7 +510,11 @@ ${summary.top_groups.map((group, index) => `${index + 1}. ${group}`).join('\n')}
   private async onSelectPriceGroup(ctx: Context) {
     const chatId = ctx.chat?.id;
     if (chatId) {
-      this.addToHistory(chatId, 'select_price_group');
+      // Проверяем, не находимся ли мы уже на этой странице
+      const currentNavigation = this.getUserNavigation(chatId);
+      if (currentNavigation.currentPage !== 'select_price_group') {
+        this.navigateTo(chatId, 'select_price_group');
+      }
       console.log(`[${chatId}] Пользователь выбирает мерч-группу для ценников`);
     }
 
@@ -474,7 +579,11 @@ ${summary.top_groups.map((group, index) => `${index + 1}. ${group}`).join('\n')}
   private async onSelectGroup(ctx: Context) {
     const chatId = ctx.chat?.id;
     if (chatId) {
-      this.addToHistory(chatId, 'select_group');
+      // Проверяем, не находимся ли мы уже на этой странице
+      const currentNavigation = this.getUserNavigation(chatId);
+      if (currentNavigation.currentPage !== 'select_group') {
+        this.navigateTo(chatId, 'select_group');
+      }
       console.log(`[${chatId}] Пользователь выбирает мерч-группу`);
     }
 
@@ -535,29 +644,65 @@ ${summary.top_groups.map((group, index) => `${index + 1}. ${group}`).join('\n')}
     }
   }
 
-  // Выбор типа ошибки
-  private async onSelectErrorType(ctx: Context) {
+  // Обработка выбора типа ошибки
+  private async handleErrorTypeSelection(ctx: Context, errorType: string) {
     const chatId = ctx.chat?.id;
-    if (chatId) {
-      this.addToHistory(chatId, 'select_error_type');
-      this.userStates.set(chatId, 'selecting_error_type');
-      console.log(`[${chatId}] Пользователь выбирает тип ошибки`);
-    }
+    if (!chatId) return;
 
-          const keyboard: ReplyKeyboardMarkup = {
+    console.log(`[${chatId}] Пользователь выбрал тип ошибки: ${errorType}`);
+
+    // Преобразуем русское название в код для API
+    const errorTypeCode = this.getErrorTypeCode(errorType);
+    console.log(`[${chatId}] Код типа ошибки для API: ${errorTypeCode}`);
+    
+    try {
+      console.log(`[${chatId}] Запрос к API getPriceErrorsByType с кодом: ${errorTypeCode}`);
+      const errors = await this.shelfSenseService.getPriceErrorsByType(errorTypeCode);
+      console.log(`[${chatId}] Получено ошибок от API: ${errors.length}`);
+      
+      if (errors.length === 0) {
+        console.log(`[${chatId}] Ошибки типа "${errorType}" не найдены`);
+        await ctx.reply(`📭 Ошибки типа "${errorType}" не найдены`);
+        return;
+      }
+
+      // Создаем кнопки с краткой информацией об ошибках
+      const errorButtons = [];
+      
+      for (const error of errors.slice(0, 8)) {
+        const buttonText = `Полка ${error.shelf_index} / Позиция ${error.position} - [${error.sku || 'Не указан'}] ${error.name || 'Без названия'}`;
+        errorButtons.push([buttonText]);
+        console.log(`[${chatId}] Создана кнопка: ${buttonText}`);
+      }
+
+      const keyboard: ReplyKeyboardMarkup = {
         keyboard: [
-          ['💰 Некорректная цена'],
-          ['🏷️ Некорректный макет'],
-          ['🔄 Несоответствие товара'],
-          ['❌ Отсутствует ценник'],
-          ['➕ Лишний ценник'],
+          ...errorButtons,
           ['🔙 Назад', '🏠 На главную']
         ],
         resize_keyboard: true,
         one_time_keyboard: false
       };
 
-    await ctx.reply('❌ Выберите тип ошибки:', { reply_markup: keyboard });
+      console.log(`[${chatId}] Отправляем меню с ${errorButtons.length} кнопками ошибок`);
+      await ctx.reply(`🏷️ Выберите ошибку ценника типа "${errorType}":`, { reply_markup: keyboard });
+      
+      // Сохраняем ошибки и тип ошибки для следующего этапа
+      if (chatId) {
+        this.userStates.set(chatId, 'selecting_error_by_type');
+        // Добавляем промежуточное состояние в историю - список ошибок по типу
+        this.navigateTo(chatId, 'error_type_list');
+        console.log(`[${chatId}] Установлено состояние: selecting_error_by_type`);
+        // Сохраняем ошибки и тип ошибки для этого пользователя
+        (this as any).userErrorsByType = (this as any).userErrorsByType || new Map();
+        (this as any).userErrorsByType.set(chatId, { errors, errorType: errorTypeCode, errorTypeDisplay: errorType });
+        console.log(`[${chatId}] Сохранены ошибки в userErrorsByType для пользователя`);
+      }
+    } catch (error) {
+      console.error(`[${chatId}] Ошибка в handleErrorTypeSelection:`, error);
+      await ctx.reply('❌ Ошибка при получении списка ошибок по ценникам');
+      this.userStates.delete(chatId);
+    }
   }
 
   // Генерация PDF
@@ -565,6 +710,8 @@ ${summary.top_groups.map((group, index) => `${index + 1}. ${group}`).join('\n')}
     const chatId = ctx.chat?.id;
     if (chatId) {
       console.log(`[${chatId}] Пользователь генерирует PDF ценников`);
+      // Добавляем состояние PDF в историю
+      this.navigateTo(chatId, 'pdf_generation');
     }
 
     try {
@@ -675,6 +822,13 @@ ${summary.top_groups.map((group, index) => `${index + 1}. ${group}`).join('\n')}
     } catch (error) {
       console.error(`[${chatId}] Ошибка при отметке задачи как выполненной:`, error);
       await ctx.reply('❌ Ошибка при отметке задачи. Попробуйте позже.');
+      this.userStates.delete(chatId);
+      (this as any).selectedVoid.delete(chatId);
+      (this as any).userVoids.delete(chatId);
+      (this as any).userGroups.delete(chatId);
+      
+      // При ошибке переходим на главную
+      await this.onBackToMain(ctx);
     }
   }
 
@@ -759,6 +913,13 @@ ${summary.top_groups.map((group, index) => `${index + 1}. ${group}`).join('\n')}
     } catch (error) {
       console.error(`[${chatId}] Ошибка при отмене задачи:`, error);
       await ctx.reply('❌ Ошибка при отмене задачи. Попробуйте позже.');
+      this.userStates.delete(chatId);
+      (this as any).selectedVoid.delete(chatId);
+      (this as any).userVoids.delete(chatId);
+      (this as any).userGroups.delete(chatId);
+      
+      // При ошибке переходим на главную
+      await this.onBackToMain(ctx);
     }
   }
 
@@ -795,9 +956,9 @@ ${summary.top_groups.map((group, index) => `${index + 1}. ${group}`).join('\n')}
     if (chatId) {
       console.log(`[${chatId}] Обновление меню`);
       this.userStates.delete(chatId);
-      this.userHistory.delete(chatId);
-      // Добавляем главную страницу в историю
-      this.addToHistory(chatId, 'main');
+      this.userNavigation.delete(chatId);
+      // Инициализируем навигацию заново
+      this.initUserNavigation(chatId);
     }
     
     const welcomeMessage = `
@@ -829,9 +990,9 @@ ${summary.top_groups.map((group, index) => `${index + 1}. ${group}`).join('\n')}
     if (chatId) {
       console.log(`[${chatId}] Возврат в главное меню`);
       this.userStates.delete(chatId);
-      this.userHistory.delete(chatId);
-      // Добавляем главную страницу в историю
-      this.addToHistory(chatId, 'main');
+      this.userNavigation.delete(chatId);
+      // Инициализируем навигацию заново
+      this.initUserNavigation(chatId);
     }
     
     const welcomeMessage = `
@@ -902,7 +1063,7 @@ ${summary.top_groups.map((group, index) => `${index + 1}. ${group}`).join('\n')}
 • В каждом разделе есть кнопки "Назад" и "На главную"
 • Статистика показывается прямо в текущем меню без перехода
 • Данные обновляются в реальном времени
-• Для получения справки нажмите "📚 Помощь" в любом меню
+• Для получения справки нажмите "📚 Помощь" в любом меню (справка показывается без изменения навигации)
 • При выполнении задач можно добавить комментарий или выбрать "Без комментария"
     `;
 
@@ -1125,6 +1286,8 @@ ${summary.top_groups.map((group, index) => `${index + 1}. ${group}`).join('\n')}
       // Сохраняем пустоты и группу для следующего этапа
       if (chatId) {
         this.userStates.set(chatId, 'selecting_void');
+        // Добавляем промежуточное состояние в историю - список пустот группы
+        this.navigateTo(chatId, 'group_void_list');
         // Сохраняем пустоты и группу для этого пользователя
         (this as any).userVoids = (this as any).userVoids || new Map();
         (this as any).userVoids.set(chatId, { voids, group: selectedGroup });
@@ -1133,65 +1296,6 @@ ${summary.top_groups.map((group, index) => `${index + 1}. ${group}`).join('\n')}
       await ctx.reply('❌ Ошибка при получении списка пустот');
       this.userStates.delete(chatId);
       (this as any).userGroups.delete(chatId);
-    }
-  }
-
-  // Обработка выбора типа ошибки
-  private async handleErrorTypeSelection(ctx: Context, errorType: string) {
-    const chatId = ctx.chat?.id;
-    if (!chatId) return;
-
-    console.log(`[${chatId}] Пользователь выбрал тип ошибки: ${errorType}`);
-
-    // Преобразуем русское название в код для API
-    const errorTypeCode = this.getErrorTypeCode(errorType);
-    console.log(`[${chatId}] Код типа ошибки для API: ${errorTypeCode}`);
-    
-    try {
-      console.log(`[${chatId}] Запрос к API getPriceErrorsByType с кодом: ${errorTypeCode}`);
-      const errors = await this.shelfSenseService.getPriceErrorsByType(errorTypeCode);
-      console.log(`[${chatId}] Получено ошибок от API: ${errors.length}`);
-      
-      if (errors.length === 0) {
-        console.log(`[${chatId}] Ошибки типа "${errorType}" не найдены`);
-        await ctx.reply(`📭 Ошибки типа "${errorType}" не найдены`);
-        return;
-      }
-
-      // Создаем кнопки с краткой информацией об ошибках
-      const errorButtons = [];
-      
-      for (const error of errors.slice(0, 8)) {
-        const buttonText = `Полка ${error.shelf_index} / Позиция ${error.position} - [${error.sku || 'Не указан'}] ${error.name || 'Без названия'}`;
-        errorButtons.push([buttonText]);
-        console.log(`[${chatId}] Создана кнопка: ${buttonText}`);
-      }
-
-      const keyboard: ReplyKeyboardMarkup = {
-        keyboard: [
-          ...errorButtons,
-          ['🔙 Назад', '🏠 На главную']
-        ],
-        resize_keyboard: true,
-        one_time_keyboard: false
-      };
-
-      console.log(`[${chatId}] Отправляем меню с ${errorButtons.length} кнопками ошибок`);
-      await ctx.reply(`🏷️ Выберите ошибку ценника типа "${errorType}":`, { reply_markup: keyboard });
-      
-      // Сохраняем ошибки и тип ошибки для следующего этапа
-      if (chatId) {
-        this.userStates.set(chatId, 'selecting_error_by_type');
-        console.log(`[${chatId}] Установлено состояние: selecting_error_by_type`);
-        // Сохраняем ошибки и тип ошибки для этого пользователя
-        (this as any).userErrorsByType = (this as any).userErrorsByType || new Map();
-        (this as any).userErrorsByType.set(chatId, { errors, errorType: errorTypeCode, errorTypeDisplay: errorType });
-        console.log(`[${chatId}] Сохранены ошибки в userErrorsByType для пользователя`);
-      }
-    } catch (error) {
-      console.error(`[${chatId}] Ошибка в handleErrorTypeSelection:`, error);
-      await ctx.reply('❌ Ошибка при получении списка ошибок по ценникам');
-      this.userStates.delete(chatId);
     }
   }
 
@@ -1268,6 +1372,8 @@ ${summary.top_groups.map((group, index) => `${index + 1}. ${group}`).join('\n')}
     // Сохраняем выбранную пустоту для обработки действий
     if (chatId) {
       this.userStates.set(chatId, 'void_action');
+      // Добавляем промежуточное состояние в историю - детальный просмотр пустоты
+      this.navigateTo(chatId, 'void_detail');
       (this as any).selectedVoid = (this as any).selectedVoid || new Map();
       (this as any).selectedVoid.set(chatId, { void: selectedVoid, group });
     }
@@ -1347,6 +1453,8 @@ ${selectedError.details ? `📝 **Детали:** ${selectedError.details}\n` : 
     // Сохраняем выбранную ошибку для обработки действий
     if (chatId) {
       this.userStates.set(chatId, 'price_error_action');
+      // Добавляем промежуточное состояние в историю - детальный просмотр ошибки ценника
+      this.navigateTo(chatId, 'price_error_detail');
       (this as any).selectedPriceError = (this as any).selectedPriceError || new Map();
       (this as any).selectedPriceError.set(chatId, { error: selectedError, group });
     }
@@ -1366,7 +1474,7 @@ ${selectedError.details ? `📝 **Детали:** ${selectedError.details}\n` : 
     }
 
     // Извлекаем оригинальное название группы из текста кнопки
-    // Формат кнопки: "Название группы (пустот: X, полки: Y,Z)" или "Название группы (?)"
+    // Формат кнопки: "Название группы (ошибок: X, типы: Y,Z)" или "Название группы (?)"
     const originalGroupName = groupName.replace(/\s*\(ошибок:\s*\d+(?:,\s*типы:\s*[^)]+)?\)$/, '').replace(/\s*\(\?\)$/, '');
     
     const selectedGroup = userGroups.find((group: any) => group.name === originalGroupName);
@@ -1406,6 +1514,8 @@ ${selectedError.details ? `📝 **Детали:** ${selectedError.details}\n` : 
       // Сохраняем ошибки и группу для следующего этапа
       if (chatId) {
         this.userStates.set(chatId, 'selecting_price_error');
+        // Добавляем промежуточное состояние в историю - список ошибок ценников группы
+        this.navigateTo(chatId, 'group_price_error_list');
         // Сохраняем ошибки и группу для этого пользователя
         (this as any).userPriceErrors = (this as any).userPriceErrors || new Map();
         (this as any).userPriceErrors.set(chatId, { errors, group: selectedGroup });
@@ -1460,6 +1570,9 @@ ${comment !== '💬 Без комментария' ? `💬 **Комментар�
           (this as any).selectedVoid.delete(chatId);
           (this as any).userVoids.delete(chatId);
           (this as any).userGroups.delete(chatId);
+          
+          // Автоматически переходим на главную
+          await this.onBackToMain(ctx);
         } catch (error) {
           console.error(`[${chatId}] Ошибка при выполнении задачи:`, error);
           await ctx.reply('❌ Ошибка при выполнении задачи. Попробуйте позже.');
@@ -1467,6 +1580,9 @@ ${comment !== '💬 Без комментария' ? `💬 **Комментар�
           (this as any).selectedVoid.delete(chatId);
           (this as any).userVoids.delete(chatId);
           (this as any).userGroups.delete(chatId);
+          
+          // При ошибке переходим на главную
+          await this.onBackToMain(ctx);
         }
       }
     } else if (userState === 'waiting_price_error_comment') {
@@ -1505,6 +1621,9 @@ ${comment !== '💬 Без комментария' ? `💬 **Комментар�
           (this as any).selectedPriceError.delete(chatId);
           (this as any).userPriceErrors.delete(chatId);
           (this as any).userGroups.delete(chatId);
+          
+          // Автоматически переходим на главную
+          await this.onBackToMain(ctx);
         } catch (error) {
           console.error(`[${chatId}] Ошибка при исправлении задачи:`, error);
           await ctx.reply('❌ Ошибка при исправлении задачи. Попробуйте позже.');
@@ -1512,6 +1631,9 @@ ${comment !== '💬 Без комментария' ? `💬 **Комментар�
           (this as any).selectedPriceError.delete(chatId);
           (this as any).userPriceErrors.delete(chatId);
           (this as any).userGroups.delete(chatId);
+          
+          // При ошибке переходим на главную
+          await this.onBackToMain(ctx);
         }
       }
     }
@@ -1560,6 +1682,9 @@ ${comment !== '💬 Без комментария' ? `💬 **Причина от
           (this as any).selectedVoid.delete(chatId);
           (this as any).userVoids.delete(chatId);
           (this as any).userGroups.delete(chatId);
+          
+          // Автоматически переходим на главную
+          await this.onBackToMain(ctx);
         } catch (error) {
           console.error(`[${chatId}] Ошибка при отмене задачи:`, error);
           await ctx.reply('❌ Ошибка при отмене задачи. Попробуйте позже.');
@@ -1567,6 +1692,9 @@ ${comment !== '💬 Без комментария' ? `💬 **Причина от
           (this as any).selectedVoid.delete(chatId);
           (this as any).userVoids.delete(chatId);
           (this as any).userGroups.delete(chatId);
+          
+          // При ошибке переходим на главную
+          await this.onBackToMain(ctx);
         }
       }
     } else if (userState === 'waiting_price_error_cancel_comment') {
@@ -1605,6 +1733,9 @@ ${comment !== '💬 Без комментария' ? `💬 **Причина от
           (this as any).selectedPriceError.delete(chatId);
           (this as any).userPriceErrors.delete(chatId);
           (this as any).userGroups.delete(chatId);
+          
+          // Автоматически переходим на главную
+          await this.onBackToMain(ctx);
         } catch (error) {
           console.error(`[${chatId}] Ошибка при отмене задачи:`, error);
           await ctx.reply('❌ Ошибка при отмене задачи. Попробуйте позже.');
@@ -1612,6 +1743,9 @@ ${comment !== '💬 Без комментария' ? `💬 **Причина от
           (this as any).selectedPriceError.delete(chatId);
           (this as any).userPriceErrors.delete(chatId);
           (this as any).userGroups.delete(chatId);
+          
+          // При ошибке переходим на главную
+          await this.onBackToMain(ctx);
         }
       }
     }
@@ -1691,106 +1825,474 @@ ${selectedError.details ? `📝 **Детали:** ${selectedError.details}\n` : 
     // Сохраняем выбранную ошибку для обработки действий
     if (chatId) {
       this.userStates.set(chatId, 'price_error_action');
+      // Добавляем промежуточное состояние в историю - детальный просмотр ошибки по типу
+      this.navigateTo(chatId, 'error_type_detail');
       (this as any).selectedPriceError = (this as any).selectedPriceError || new Map();
       (this as any).selectedPriceError.set(chatId, { error: selectedError, group: selectedError.merch_group });
     }
   }
 
-  // Добавление в историю навигации
-  private addToHistory(chatId: number, page: string) {
-    if (!this.userHistory.has(chatId)) {
-      this.userHistory.set(chatId, []);
+  // Методы для показа промежуточных списков при навигации назад
+
+  // Показать список пустот группы
+  private async showVoidList(ctx: Context) {
+    const chatId = ctx.chat?.id;
+    if (!chatId) return;
+
+    const userVoids = (this as any).userVoids?.get(chatId);
+    if (!userVoids) {
+      await ctx.reply('❌ Ошибка: список пустот не найден');
+      return;
     }
-    const history = this.userHistory.get(chatId)!;
-    history.push(page);
-    // Ограничиваем историю последними 10 страницами
-    if (history.length > 10) {
-      history.shift();
+
+    const { voids, group } = userVoids;
+    
+    // Создаем кнопки с краткой информацией о пустотах
+    const voidButtons = [];
+    
+    for (const voidItem of voids.slice(0, 8)) {
+      const buttonText = `Полка ${voidItem.shelf_index} / Позиция ${voidItem.position} - [${voidItem.sku}] ${voidItem.name}`;
+      voidButtons.push([buttonText]);
     }
-    console.log(`[${chatId}] История навигации: ${history.join(' → ')}`);
+
+    const keyboard: ReplyKeyboardMarkup = {
+      keyboard: [
+        ...voidButtons,
+        ['🔙 Назад', '🏠 На главную']
+      ],
+      resize_keyboard: true,
+      one_time_keyboard: false
+    };
+
+    await ctx.reply(`🪑 Выберите пустоту в группе "${group.name}":`, { reply_markup: keyboard });
+    this.userStates.set(chatId, 'selecting_void');
   }
 
-  // Получение предыдущей страницы из истории
-  private getPreviousPage(chatId: number): string | null {
-    const history = this.userHistory.get(chatId);
-    if (!history || history.length < 2) {
-      return null;
+  // Показать список ошибок ценников группы
+  private async showPriceErrorList(ctx: Context) {
+    const chatId = ctx.chat?.id;
+    if (!chatId) return;
+
+    const userPriceErrors = (this as any).userPriceErrors?.get(chatId);
+    if (!userPriceErrors) {
+      await ctx.reply('❌ Ошибка: список ошибок ценников не найден');
+      return;
     }
-    // Убираем текущую страницу и возвращаем предыдущую
-    history.pop();
-    return history[history.length - 1] || null;
+
+    const { errors, group } = userPriceErrors;
+    
+    // Создаем кнопки с краткой информацией об ошибках
+    const errorButtons = [];
+    
+    for (const error of errors.slice(0, 8)) {
+      const buttonText = `${this.getErrorTypeDisplayName(error.error_type)} - Полка ${error.shelf_index} / Позиция ${error.position} - [${error.sku || 'Не указан'}] ${error.name || 'Без названия'}`;
+      errorButtons.push([buttonText]);
+    }
+
+    const keyboard: ReplyKeyboardMarkup = {
+      keyboard: [
+        ...errorButtons,
+        ['🔙 Назад', '🏠 На главную']
+      ],
+      resize_keyboard: true,
+      one_time_keyboard: false
+    };
+
+    await ctx.reply(`🏷️ Выберите ошибку ценника в группе "${group.name}":`, { reply_markup: keyboard });
+    this.userStates.set(chatId, 'selecting_price_error');
   }
 
-  // Обработка кнопки "Назад"
+  // Показать список ошибок по типу
+  private async showErrorTypeList(ctx: Context) {
+    const chatId = ctx.chat?.id;
+    if (!chatId) return;
+
+    const userErrorsByType = (this as any).userErrorsByType?.get(chatId);
+    if (!userErrorsByType) {
+      await ctx.reply('❌ Ошибка: список ошибок по типу не найден');
+      return;
+    }
+
+    const { errors, errorTypeDisplay } = userErrorsByType;
+    
+    // Создаем кнопки с краткой информацией об ошибках
+    const errorButtons = [];
+    
+    for (const error of errors.slice(0, 8)) {
+      const buttonText = `Полка ${error.shelf_index} / Позиция ${error.position} - [${error.sku || 'Не указан'}] ${error.name || 'Без названия'}`;
+      errorButtons.push([buttonText]);
+    }
+
+    const keyboard: ReplyKeyboardMarkup = {
+      keyboard: [
+        ...errorButtons,
+        ['🔙 Назад', '🏠 На главную']
+      ],
+      resize_keyboard: true,
+      one_time_keyboard: false
+    };
+
+    await ctx.reply(`🏷️ Выберите ошибку ценника типа "${errorTypeDisplay}":`, { reply_markup: keyboard });
+    this.userStates.set(chatId, 'selecting_error_by_type');
+  }
+
+  // Показать список пустот группы (для возврата из детального просмотра)
+  private async showGroupVoidList(ctx: Context) {
+    await this.showVoidList(ctx);
+  }
+
+  // Показать список ошибок ценников группы (для возврата из детального просмотра)
+  private async showGroupPriceErrorList(ctx: Context) {
+    await this.showPriceErrorList(ctx);
+  }
+
+  // Показать справку inline (без изменения навигации)
+  private async showHelpInline(ctx: Context) {
+    const chatId = ctx.chat?.id;
+    if (chatId) {
+      console.log(`[${chatId}] Пользователь открыл справку (inline)`);
+    }
+
+    const helpMessage = `
+📚 **Справка по ShelfSense Bot**
+
+🤖 **Что умеет бот:**
+Этот бот помогает сотрудникам магазина управлять выкладкой товаров и исправлять ошибки ценников через удобное меню.
+
+📊 **Выкладка товара:**
+• **Статистика** - показывает общую статистику по магазину прямо в меню:
+  - Количество стеллажей с пустотами
+  - Количество артикулов к выкладке
+  - TOP-5 товарных групп к выкладке
+• **Выбрать группу** - позволяет выбрать мерч-группу и увидеть:
+  - Список пустот с указанием полки и позиции
+  - Информацию о товарах (артикул, название, остатки)
+  - Фото стеллажа с визуальным обозначением
+  - Возможность отметить выполнение или отмену
+
+🏷️ **Ценники:**
+• **Статистика** - показывает статистику по ошибкам ценников прямо в меню:
+  - Количество стеллажей с ошибками
+  - Распределение по типам ошибок
+  - TOP-5 товарных групп к исправлению
+• **Распечатать ценники** - генерирует PDF-документ для печати
+• **Выбрать тип ошибки** - фильтрует ошибки по типам:
+  - 💰 Некорректная цена
+  - 🏷️ Некорректный макет
+  - 🔄 Несоответствие товара
+  - ❌ Отсутствует ценник
+  - ➕ Лишний ценник
+• **Выбрать группу** - показывает ошибки в конкретной группе
+
+🎯 **Навигация:**
+• **🔙 Назад** - возврат на предыдущую страницу
+• **🏠 На главную** - возврат в главное меню
+• **🔄 Обновить меню** - обновление данных с сервера
+
+💡 **Советы:**
+• Используйте кнопки меню для навигации
+• В каждом разделе есть кнопки "Назад" и "На главную"
+• Статистика показывается прямо в текущем меню без перехода
+• Данные обновляются в реальном времени
+• Для получения справки нажмите "📚 Помощь" в любом меню
+• При выполнении задач можно добавить комментарий или выбрать "Без комментария"
+    `;
+
+    await ctx.reply(helpMessage, { parse_mode: 'Markdown' });
+  }
+
+  // Обработка кнопки "Назад" с пошаговой навигацией
   private async onBack(ctx: Context) {
     const chatId = ctx.chat?.id;
     if (!chatId) return;
 
     console.log(`[${chatId}] Пользователь нажал кнопку "Назад"`);
 
-    const previousPage = this.getPreviousPage(chatId);
-    console.log(`[${chatId}] Предыдущая страница: ${previousPage}`);
+    // Получаем предыдущую страницу из стека
+    const previousPage = this.goBack(chatId);
+    console.log(`[${chatId}] Предыдущая страница из стека: ${previousPage}`);
     
-    if (!previousPage) {
-      // Если истории нет, возвращаемся на главную
-      console.log(`[${chatId}] История пуста, возвращаемся на главную`);
+    if (!previousPage || previousPage === 'main') {
+      // Если истории нет или возвращаемся на главную
+      console.log(`[${chatId}] Возвращаемся на главную`);
       await this.onBackToMain(ctx);
       return;
     }
 
     // Возвращаемся на предыдущую страницу
     console.log(`[${chatId}] Возвращаемся на страницу: ${previousPage}`);
-    switch (previousPage) {
-      case 'main':
-        await this.onBackToMain(ctx);
-        break;
+    
+    try {
+      await this.navigateToPage(ctx, previousPage, chatId);
+    } catch (error) {
+      console.error(`[${chatId}] Ошибка при возврате на ${previousPage}:`, error);
+      // При ошибке возвращаемся на главную
+      await this.onBackToMain(ctx);
+    }
+  }
+
+  // Умная навигация на страницу с восстановлением контекста
+  private async navigateToPage(ctx: Context, page: string, chatId: number) {
+    console.log(`[${chatId}] Умная навигация на: ${page}`);
+    
+    switch (page) {
       case 'shelf_management':
-        await this.showShelfManagementMenu(ctx, false); // false = не добавляем в историю
+        await this.showShelfManagementMenu(ctx);
         break;
+        
       case 'price_tags':
-        await this.showPriceTagsMenu(ctx, false); // false = не добавляем в историю
+        await this.showPriceTagsMenu(ctx);
         break;
-      case 'shelf_summary':
-        await this.showShelfManagementMenu(ctx, false); // Возвращаемся в меню выкладки
+        
+      case 'select_group':
+        // Восстанавливаем контекст выбора группы
+        await this.restoreGroupSelectionContext(ctx, chatId);
         break;
-      case 'price_summary':
-        await this.showPriceTagsMenu(ctx, false); // Возвращаемся в меню ценников
+        
+      case 'select_price_group':
+        // Восстанавливаем контекст выбора группы для ценников
+        await this.restorePriceGroupSelectionContext(ctx, chatId);
         break;
-             case 'select_group':
-         // Возвращаемся в предыдущее меню в зависимости от контекста
-         const userState = this.userStates.get(chatId);
-         if (userState === 'selecting_price_group') {
-           await this.showPriceTagsMenu(ctx, false);
-         } else {
-           await this.showShelfManagementMenu(ctx, false);
-         }
-         break;
-       case 'select_price_group':
-         // Возвращаемся в меню ценников
-         await this.showPriceTagsMenu(ctx, false);
-         break;
+        
       case 'select_error_type':
-        await this.showPriceTagsMenu(ctx, false); // Возвращаемся в меню ценников
-        break;
-      case 'selecting_error_by_type':
-        // Возвращаемся к выбору типа ошибки
         await this.onSelectErrorType(ctx);
         break;
+        
+      case 'error_type_list':
+        // Восстанавливаем список ошибок по типу
+        await this.restoreErrorTypeListContext(ctx, chatId);
+        break;
+        
+      case 'group_void_list':
+        // Восстанавливаем список пустот группы
+        await this.restoreGroupVoidListContext(ctx, chatId);
+        break;
+        
+      case 'group_price_error_list':
+        // Восстанавливаем список ошибок ценников группы
+        await this.restoreGroupPriceErrorListContext(ctx, chatId);
+        break;
+        
+      case 'void_detail':
+        // Восстанавливаем детальный просмотр пустоты
+        await this.restoreVoidDetailContext(ctx, chatId);
+        break;
+        
+      case 'price_error_detail':
+        // Восстанавливаем детальный просмотр ошибки ценника
+        await this.restorePriceErrorDetailContext(ctx, chatId);
+        break;
+        
+      case 'error_type_detail':
+        // Восстанавливаем детальный просмотр ошибки по типу
+        await this.restoreErrorTypeDetailContext(ctx, chatId);
+        break;
+        
       case 'waiting_void_comment':
       case 'waiting_price_error_comment':
       case 'waiting_void_cancel_comment':
       case 'waiting_price_error_cancel_comment':
         // Возвращаемся к выбору конкретной пустоты/ошибки
-        const currentUserState = this.userStates.get(chatId);
-        if (currentUserState === 'waiting_void_comment' || currentUserState === 'waiting_void_cancel_comment') {
-          // Возвращаемся к выбору пустоты
-          const userVoids = (this as any).userVoids?.get(chatId);
-          if (userVoids) {
-            const { voids, group } = userVoids;
-            const selectedVoid = (this as any).selectedVoid?.get(chatId);
-            if (selectedVoid) {
-              // Показываем детальную информацию о пустоте снова
-              const responseMessage = `🪑 **Детальная информация о пустоте:**
+        await this.restoreTaskActionContext(ctx, chatId);
+        break;
+        
+      default:
+        console.log(`[${chatId}] Неизвестная страница: ${page}, возвращаемся на главную`);
+        await this.onBackToMain(ctx);
+        break;
+    }
+  }
+
+  // Восстановление контекста выбора группы
+  private async restoreGroupSelectionContext(ctx: Context, chatId: number) {
+    const userGroups = (this as any).userGroups?.get(chatId);
+    if (!userGroups) {
+      await ctx.reply('❌ Контекст выбора группы потерян. Выберите группу снова.');
+      await this.onSelectGroup(ctx);
+      return;
+    }
+    
+    // Показываем список групп снова, даже если уже находимся на этой странице
+    try {
+      // Создаем кнопки с информацией о пустотах прямо в названии
+      const groupButtons = [];
+      
+      for (const group of userGroups.slice(0, 8)) {
+        try {
+          const voids = await this.shelfSenseService.getShelvesVoids(group.id);
+          const voidCount = voids.length;
+          
+          // Формируем название кнопки с информацией
+          let buttonText = `${group.name}`;
+          if (voidCount > 0) {
+            // Получаем уникальные номера полок
+            const shelfNumbers = [...new Set(voids.map(v => v.shelf_index))].sort((a, b) => a - b);
+            const shelfList = shelfNumbers.join(',');
+            buttonText += ` (пустот: ${voidCount}, полки: ${shelfList})`;
+          } else {
+            buttonText += ` (пустот: 0)`;
+          }
+          
+          groupButtons.push([buttonText]);
+        } catch (error) {
+          // Если не удалось получить данные, показываем группу без информации
+          groupButtons.push([`${group.name} (?)`]);
+        }
+      }
+      
+      const keyboard: ReplyKeyboardMarkup = {
+        keyboard: [
+          ...groupButtons,
+          ['🔙 Назад', '🏠 На главную']
+        ],
+        resize_keyboard: true,
+        one_time_keyboard: false
+      };
+
+      await ctx.reply('🏷️ Выберите мерч-группу:', { reply_markup: keyboard });
+      
+      // Устанавливаем правильное состояние
+      this.userStates.set(chatId, 'selecting_group');
+    } catch (error) {
+      await ctx.reply('❌ Ошибка при восстановлении списка групп');
+      await this.onSelectGroup(ctx);
+    }
+  }
+
+  // Восстановление контекста выбора группы для ценников
+  private async restorePriceGroupSelectionContext(ctx: Context, chatId: number) {
+    const userGroups = (this as any).userGroups?.get(chatId);
+    if (!userGroups) {
+      await ctx.reply('❌ Контекст выбора группы потерян. Выберите группу снова.');
+      await this.onSelectPriceGroup(ctx);
+      return;
+    }
+    
+    // Показываем список групп для ценников снова, даже если уже находимся на этой странице
+    try {
+      // Создаем кнопки с информацией об ошибках ценников прямо в названии
+      const groupButtons = [];
+      
+      for (const group of userGroups.slice(0, 8)) {
+        try {
+          const errors = await this.shelfSenseService.getPriceErrorsByGroup(group.id);
+          const errorCount = errors.length;
+          
+          // Формируем название кнопки с информацией
+          let buttonText = `${group.name}`;
+          if (errorCount > 0) {
+            // Получаем уникальные типы ошибок
+            const errorTypes = [...new Set(errors.map(e => e.error_type))];
+            const errorTypesList = errorTypes.map(type => this.getErrorTypeDisplayName(type)).join(', ');
+            buttonText += ` (ошибок: ${errorCount}, типы: ${errorTypesList})`;
+          } else {
+            buttonText += ` (ошибок: 0)`;
+          }
+          
+          groupButtons.push([buttonText]);
+        } catch (error) {
+          console.error(`[${chatId}] Ошибка получения ошибок ценников для группы ${group.name}:`, error);
+          groupButtons.push([`${group.name} (?)`]); // Fallback button text
+        }
+      }
+      
+      const keyboard: ReplyKeyboardMarkup = {
+        keyboard: [
+          ...groupButtons,
+          ['🔙 Назад', '🏠 На главную']
+        ],
+        resize_keyboard: true,
+        one_time_keyboard: false
+      };
+
+      await ctx.reply('🏷️ Выберите мерч-группу для просмотра ошибок ценников:', { reply_markup: keyboard });
+      
+      // Устанавливаем правильное состояние
+      this.userStates.set(chatId, 'selecting_price_group');
+    } catch (error) {
+      await ctx.reply('❌ Ошибка при восстановлении списка групп для ценников');
+      await this.onSelectPriceGroup(ctx);
+    }
+  }
+
+  // Восстановление контекста списка ошибок по типу
+  private async restoreErrorTypeListContext(ctx: Context, chatId: number) {
+    const userErrorsByType = (this as any).userErrorsByType?.get(chatId);
+    if (!userErrorsByType) {
+      await ctx.reply('❌ Контекст списка ошибок потерян. Выберите тип ошибки снова.');
+      await this.onSelectErrorType(ctx);
+      return;
+    }
+    
+    // Показываем список ошибок по типу снова
+    await this.showErrorTypeList(ctx);
+  }
+
+  // Восстановление контекста списка пустот группы
+  private async restoreGroupVoidListContext(ctx: Context, chatId: number) {
+    const userVoids = (this as any).userVoids?.get(chatId);
+    if (!userVoids) {
+      await ctx.reply('❌ Контекст списка пустот потерян. Выберите группу снова.');
+      await this.onSelectGroup(ctx);
+      return;
+    }
+    
+    // Показываем список пустот группы снова
+    await this.showVoidList(ctx);
+  }
+
+  // Восстановление контекста списка ошибок ценников группы
+  private async restoreGroupPriceErrorListContext(ctx: Context, chatId: number) {
+    const userPriceErrors = (this as any).userPriceErrors?.get(chatId);
+    if (!userPriceErrors) {
+      await ctx.reply('❌ Контекст списка ошибок ценников потерян. Выберите группу снова.');
+      await this.onSelectPriceGroup(ctx);
+      return;
+    }
+    
+    // Показываем список ошибок ценников группы снова
+    await this.showPriceErrorList(ctx);
+  }
+
+  // Восстановление контекста списка пустот
+  private async restoreVoidListContext(ctx: Context, chatId: number) {
+    const userVoids = (this as any).userVoids?.get(chatId);
+    if (!userVoids) {
+      await ctx.reply('❌ Контекст списка пустот потерян. Выберите группу снова.');
+      await this.onSelectGroup(ctx);
+      return;
+    }
+    
+    // Показываем список пустот снова
+    await this.showVoidList(ctx);
+  }
+
+  // Восстановление контекста списка ошибок ценников
+  private async restorePriceErrorListContext(ctx: Context, chatId: number) {
+    const userPriceErrors = (this as any).userPriceErrors?.get(chatId);
+    if (!userPriceErrors) {
+      await ctx.reply('❌ Контекст списка ошибок ценников потерян. Выберите группу снова.');
+      await this.onSelectPriceGroup(ctx);
+      return;
+    }
+    
+    // Показываем список ошибок ценников снова
+    await this.showPriceErrorList(ctx);
+  }
+
+  // Восстановление контекста действия с задачей
+  private async restoreTaskActionContext(ctx: Context, chatId: number) {
+    const currentUserState = this.userStates.get(chatId);
+    
+    if (currentUserState === 'waiting_void_comment' || currentUserState === 'waiting_void_cancel_comment') {
+      // Возвращаемся к выбору пустоты
+      const userVoids = (this as any).userVoids?.get(chatId);
+      if (userVoids) {
+        const { voids, group } = userVoids;
+        const selectedVoid = (this as any).selectedVoid?.get(chatId);
+        if (selectedVoid) {
+          // Показываем детальную информацию о пустоте снова
+          const responseMessage = `🪑 **Детальная информация о пустоте:**
 
 📍 **Расположение:** Полка ${selectedVoid.void.shelf_index} / Позиция ${selectedVoid.void.position}
 🏷️ **Группа:** ${group.name}
@@ -1799,46 +2301,47 @@ ${selectedError.details ? `📝 **Детали:** ${selectedError.details}\n` : 
 
 💡 Выберите действие:`;
 
-              const keyboard: ReplyKeyboardMarkup = {
-                keyboard: [
-                  ['✅ Выполнено'],
-                  ['❌ Отмена'],
-                  ['🔙 Назад', '🏠 На главную']
-                ],
-                resize_keyboard: true,
-                one_time_keyboard: false
-              };
+          const keyboard: ReplyKeyboardMarkup = {
+            keyboard: [
+              ['✅ Выполнено'],
+              ['❌ Отмена'],
+              ['🔙 Назад', '🏠 На главную']
+            ],
+            resize_keyboard: true,
+            one_time_keyboard: false
+          };
 
-              // Отправляем фото с описанием в одном сообщении, если фото есть
-              if (selectedVoid.void.photo_url) {
-                try {
-                  await ctx.replyWithPhoto(selectedVoid.void.photo_url, {
-                    caption: responseMessage,
-                    parse_mode: 'Markdown',
-                    reply_markup: keyboard
-                  });
-                } catch (error) {
-                  console.error(`[${chatId}] Ошибка при отправке фото:`, error);
-                  // Если не удалось отправить фото, отправляем только текст
-                  await ctx.reply(responseMessage, { reply_markup: keyboard, parse_mode: 'Markdown' });
-                }
-              } else {
-                // Если фото нет, отправляем только текст
-                await ctx.reply(responseMessage, { reply_markup: keyboard, parse_mode: 'Markdown' });
-              }
-
-              this.userStates.set(chatId, 'void_action');
+          // Отправляем фото с описанием в одном сообщении, если фото есть
+          if (selectedVoid.void.photo_url) {
+            try {
+              await ctx.replyWithPhoto(selectedVoid.void.photo_url, {
+                caption: responseMessage,
+                parse_mode: 'Markdown',
+                reply_markup: keyboard
+              });
+            } catch (error) {
+              console.error(`[${chatId}] Ошибка при отправке фото:`, error);
+              // Если не удалось отправить фото, отправляем только текст
+              await ctx.reply(responseMessage, { reply_markup: keyboard, parse_mode: 'Markdown' });
             }
+          } else {
+            // Если фото нет, отправляем только текст
+            await ctx.reply(responseMessage, { reply_markup: keyboard, parse_mode: 'Markdown' });
           }
-        } else if (currentUserState === 'waiting_price_error_comment' || currentUserState === 'waiting_price_error_cancel_comment') {
-          // Возвращаемся к выбору ошибки ценника
-          const userPriceErrors = (this as any).userPriceErrors?.get(chatId);
-          if (userPriceErrors) {
-            const { errors, group } = userPriceErrors;
-            const selectedPriceError = (this as any).selectedPriceError?.get(chatId);
-            if (selectedPriceError) {
-              // Показываем детальную информацию об ошибке снова
-              const responseMessage = `🏷️ **Детальная информация об ошибке ценника:**
+
+          // Устанавливаем правильное состояние
+          this.userStates.set(chatId, 'void_action');
+        }
+      }
+    } else if (currentUserState === 'waiting_price_error_comment' || currentUserState === 'waiting_price_error_cancel_comment') {
+      // Возвращаемся к выбору ошибки ценника
+      const userPriceErrors = (this as any).userPriceErrors?.get(chatId);
+      if (userPriceErrors) {
+        const { errors, group } = userPriceErrors;
+        const selectedPriceError = (this as any).selectedPriceError?.get(chatId);
+        if (selectedPriceError) {
+          // Показываем детальную информацию об ошибке снова
+          const responseMessage = `🏷️ **Детальная информация об ошибке ценника:**
 
 📍 **Расположение:** Полка ${selectedPriceError.error.shelf_index} / Позиция ${selectedPriceError.error.position}
 🏷️ **Группа:** ${group.name}
@@ -1848,43 +2351,228 @@ ${selectedPriceError.error.details ? `📝 **Детали:** ${selectedPriceErro
 
 💡 Выберите действие:`;
 
-              const keyboard: ReplyKeyboardMarkup = {
-                keyboard: [
-                  ['✅ Выполнено'],
-                  ['❌ Отмена'],
-                  ['🔙 Назад', '🏠 На главную']
-                ],
-                resize_keyboard: true,
-                one_time_keyboard: false
-              };
+          const keyboard: ReplyKeyboardMarkup = {
+            keyboard: [
+              ['✅ Выполнено'],
+              ['❌ Отмена'],
+              ['🔙 Назад', '🏠 На главную']
+            ],
+            resize_keyboard: true,
+            one_time_keyboard: false
+          };
 
-              // Отправляем фото с описанием в одном сообщении, если фото есть
-              if (selectedPriceError.error.photo_url) {
-                try {
-                  await ctx.replyWithPhoto(selectedPriceError.error.photo_url, {
-                    caption: responseMessage,
-                    parse_mode: 'Markdown',
-                    reply_markup: keyboard
-                  });
-                } catch (error) {
-                  console.error(`[${chatId}] Ошибка при отправке фото:`, error);
-                  // Если не удалось отправить фото, отправляем только текст
-                  await ctx.reply(responseMessage, { reply_markup: keyboard, parse_mode: 'Markdown' });
-                }
-              } else {
-                // Если фото нет, отправляем только текст
-                await ctx.reply(responseMessage, { reply_markup: keyboard, parse_mode: 'Markdown' });
-              }
-
-              this.userStates.set(chatId, 'price_error_action');
+          // Отправляем фото с описанием в одном сообщении, если фото есть
+          if (selectedPriceError.error.photo_url) {
+            try {
+              await ctx.replyWithPhoto(selectedPriceError.error.photo_url, {
+                caption: responseMessage,
+                parse_mode: 'Markdown',
+                reply_markup: keyboard
+              });
+            } catch (error) {
+              console.error(`[${chatId}] Ошибка при отправке фото:`, error);
+              // Если не удалось отправить фото, отправляем только текст
+              await ctx.reply(responseMessage, { reply_markup: keyboard, parse_mode: 'Markdown' });
             }
+          } else {
+            // Если фото нет, отправляем только текст
+            await ctx.reply(responseMessage, { reply_markup: keyboard, parse_mode: 'Markdown' });
           }
+
+          // Устанавливаем правильное состояние
+          this.userStates.set(chatId, 'price_error_action');
         }
-        break;
-      default:
-        console.log(`[${chatId}] Неизвестная страница в истории: ${previousPage}, возвращаемся на главную`);
-        await this.onBackToMain(ctx);
-        break;
+      }
     }
+  }
+
+  // Выбор типа ошибки
+  private async onSelectErrorType(ctx: Context) {
+    const chatId = ctx.chat?.id;
+    if (chatId) {
+      // Проверяем, не находимся ли мы уже на этой странице
+      const currentNavigation = this.getUserNavigation(chatId);
+      if (currentNavigation.currentPage !== 'select_error_type') {
+        this.navigateTo(chatId, 'select_error_type');
+      }
+      this.userStates.set(chatId, 'selecting_error_type');
+      console.log(`[${chatId}] Пользователь выбирает тип ошибки`);
+    }
+
+    const keyboard: ReplyKeyboardMarkup = {
+      keyboard: [
+        ['💰 Некорректная цена'],
+        ['🏷️ Некорректный макет'],
+        ['🔄 Несоответствие товара'],
+        ['❌ Отсутствует ценник'],
+        ['➕ Лишний ценник'],
+        ['🔙 Назад', '🏠 На главную']
+      ],
+      resize_keyboard: true,
+      one_time_keyboard: false
+    };
+
+    await ctx.reply('❌ Выберите тип ошибки:', { reply_markup: keyboard });
+  }
+
+  // Восстановление контекста детального просмотра пустоты
+  private async restoreVoidDetailContext(ctx: Context, chatId: number) {
+    const selectedVoid = (this as any).selectedVoid?.get(chatId);
+    if (!selectedVoid) {
+      await ctx.reply('❌ Контекст детального просмотра пустоты потерян. Выберите группу снова.');
+      await this.onSelectGroup(ctx);
+      return;
+    }
+    
+    const { void: voidItem, group } = selectedVoid;
+    
+    // Показываем детальную информацию о пустоте снова
+    const responseMessage = `🪑 **Детальная информация о пустоте:**
+
+📍 **Расположение:** Полка ${voidItem.shelf_index} / Позиция ${voidItem.position}
+🏷️ **Группа:** ${group.name}
+📦 **Товар:** [${voidItem.sku}] ${voidItem.name}
+📊 **Остатки:** ${voidItem.stock}
+
+💡 Выберите действие:`;
+
+    const keyboard: ReplyKeyboardMarkup = {
+      keyboard: [
+        ['✅ Выполнено'],
+        ['❌ Отмена'],
+        ['🔙 Назад', '🏠 На главную']
+      ],
+      resize_keyboard: true,
+      one_time_keyboard: false
+    };
+
+    // Отправляем фото с описанием в одном сообщении, если фото есть
+    if (voidItem.photo_url) {
+      try {
+        await ctx.replyWithPhoto(voidItem.photo_url, {
+          caption: responseMessage,
+          parse_mode: 'Markdown',
+          reply_markup: keyboard
+        });
+      } catch (error) {
+        console.error(`[${chatId}] Ошибка при отправке фото:`, error);
+        // Если не удалось отправить фото, отправляем только текст
+        await ctx.reply(responseMessage, { reply_markup: keyboard, parse_mode: 'Markdown' });
+      }
+    } else {
+      // Если фото нет, отправляем только текст
+      await ctx.reply(responseMessage, { reply_markup: keyboard, parse_mode: 'Markdown' });
+    }
+
+    // Устанавливаем правильное состояние
+    this.userStates.set(chatId, 'void_action');
+  }
+
+  // Восстановление контекста детального просмотра ошибки ценника
+  private async restorePriceErrorDetailContext(ctx: Context, chatId: number) {
+    const selectedPriceError = (this as any).selectedPriceError?.get(chatId);
+    if (!selectedPriceError) {
+      await ctx.reply('❌ Контекст детального просмотра ошибки ценника потерян. Выберите группу снова.');
+      await this.onSelectPriceGroup(ctx);
+      return;
+    }
+    
+    const { error, group } = selectedPriceError;
+    
+    // Показываем детальную информацию об ошибке снова
+    const responseMessage = `🏷️ **Детальная информация об ошибке ценника:**
+
+📍 **Расположение:** Полка ${error.shelf_index} / Позиция ${error.position}
+🏷️ **Группа:** ${group.name}
+❌ **Тип ошибки:** ${this.getErrorTypeDisplayName(error.error_type)}
+📦 **Товар:** [${error.sku || 'Не указан'}] ${error.name || 'Без названия'}
+${error.details ? `📝 **Детали:** ${error.details}\n` : ''}
+
+💡 Выберите действие:`;
+
+    const keyboard: ReplyKeyboardMarkup = {
+      keyboard: [
+        ['✅ Выполнено'],
+        ['❌ Отмена'],
+        ['🔙 Назад', '🏠 На главную']
+      ],
+      resize_keyboard: true,
+      one_time_keyboard: false
+    };
+
+    // Отправляем фото с описанием в одном сообщении, если фото есть
+    if (error.photo_url) {
+      try {
+        await ctx.replyWithPhoto(error.photo_url, {
+          caption: responseMessage,
+          parse_mode: 'Markdown',
+          reply_markup: keyboard
+        });
+      } catch (error) {
+        console.error(`[${chatId}] Ошибка при отправке фото:`, error);
+        // Если не удалось отправить фото, отправляем только текст
+        await ctx.reply(responseMessage, { reply_markup: keyboard, parse_mode: 'Markdown' });
+      }
+    } else {
+      // Если фото нет, отправляем только текст
+      await ctx.reply(responseMessage, { reply_markup: keyboard, parse_mode: 'Markdown' });
+    }
+
+    // Устанавливаем правильное состояние
+    this.userStates.set(chatId, 'price_error_action');
+  }
+
+  // Восстановление контекста детального просмотра ошибки по типу
+  private async restoreErrorTypeDetailContext(ctx: Context, chatId: number) {
+    const selectedPriceError = (this as any).selectedPriceError?.get(chatId);
+    if (!selectedPriceError) {
+      await ctx.reply('❌ Контекст детального просмотра ошибки по типу потерян. Выберите тип ошибки снова.');
+      await this.onSelectErrorType(ctx);
+      return;
+    }
+    
+    const { error, group } = selectedPriceError;
+    
+    // Показываем детальную информацию об ошибке снова
+    const responseMessage = `🏷️ **Детальная информация об ошибке ценника:**
+
+📍 **Расположение:** Полка ${error.shelf_index} / Позиция ${error.position}
+🏷️ **Группа:** ${group.name}
+❌ **Тип ошибки:** ${this.getErrorTypeDisplayName(error.error_type)}
+📦 **Товар:** [${error.sku || 'Не указан'}] ${error.name || 'Без названия'}
+${error.details ? `📝 **Детали:** ${error.details}\n` : ''}
+
+💡 Выберите действие:`;
+
+    const keyboard: ReplyKeyboardMarkup = {
+      keyboard: [
+        ['✅ Выполнено'],
+        ['❌ Отмена'],
+        ['🔙 Назад', '🏠 На главную']
+      ],
+      resize_keyboard: true,
+      one_time_keyboard: false
+    };
+
+    // Отправляем фото с описанием в одном сообщении, если фото есть
+    if (error.photo_url) {
+      try {
+        await ctx.replyWithPhoto(error.photo_url, {
+          caption: responseMessage,
+          parse_mode: 'Markdown',
+          reply_markup: keyboard
+        });
+      } catch (error) {
+        console.error(`[${chatId}] Ошибка при отправке фото:`, error);
+        // Если не удалось отправить фото, отправляем только текст
+        await ctx.reply(responseMessage, { reply_markup: keyboard, parse_mode: 'Markdown' });
+      }
+    } else {
+      // Если фото нет, отправляем только текст
+      await ctx.reply(responseMessage, { reply_markup: keyboard, parse_mode: 'Markdown' });
+    }
+
+    // Устанавливаем правильное состояние
+    this.userStates.set(chatId, 'price_error_action');
   }
 }
