@@ -51,6 +51,14 @@ export class TelegramBotService implements OnModuleInit {
       throw new Error('TELEGRAM_BOT_TOKEN не настроен');
     }
     
+    // Инициализируем все Map объекты для предотвращения ошибок
+    (this as any).userGroups = new Map();
+    (this as any).userVoids = new Map();
+    (this as any).userPriceErrors = new Map();
+    (this as any).userErrorsByType = new Map();
+    (this as any).selectedVoid = new Map();
+    (this as any).selectedPriceError = new Map();
+    
     this.bot = new Telegraf(token);
     this.setupCommands();
   }
@@ -1566,20 +1574,14 @@ ${comment !== '💬 Без комментария' ? `💬 **Комментар�
           await ctx.reply(message, { reply_markup: keyboard, parse_mode: 'Markdown' });
           
           // Очищаем состояние
-          this.userStates.delete(chatId);
-          (this as any).selectedVoid.delete(chatId);
-          (this as any).userVoids.delete(chatId);
-          (this as any).userGroups.delete(chatId);
+          this.safeCleanupUserState(chatId);
           
           // Автоматически переходим на главную
           await this.onBackToMain(ctx);
         } catch (error) {
           console.error(`[${chatId}] Ошибка при выполнении задачи:`, error);
           await ctx.reply('❌ Ошибка при выполнении задачи. Попробуйте позже.');
-          this.userStates.delete(chatId);
-          (this as any).selectedVoid.delete(chatId);
-          (this as any).userVoids.delete(chatId);
-          (this as any).userGroups.delete(chatId);
+          this.safeCleanupUserState(chatId);
           
           // При ошибке переходим на главную
           await this.onBackToMain(ctx);
@@ -1617,20 +1619,14 @@ ${comment !== '💬 Без комментария' ? `💬 **Комментар�
           await ctx.reply(message, { reply_markup: keyboard, parse_mode: 'Markdown' });
           
           // Очищаем состояние
-          this.userStates.delete(chatId);
-          (this as any).selectedPriceError.delete(chatId);
-          (this as any).userPriceErrors.delete(chatId);
-          (this as any).userGroups.delete(chatId);
+          this.safeCleanupUserState(chatId);
           
           // Автоматически переходим на главную
           await this.onBackToMain(ctx);
         } catch (error) {
           console.error(`[${chatId}] Ошибка при исправлении задачи:`, error);
           await ctx.reply('❌ Ошибка при исправлении задачи. Попробуйте позже.');
-          this.userStates.delete(chatId);
-          (this as any).selectedPriceError.delete(chatId);
-          (this as any).userPriceErrors.delete(chatId);
-          (this as any).userGroups.delete(chatId);
+          this.safeCleanupUserState(chatId);
           
           // При ошибке переходим на главную
           await this.onBackToMain(ctx);
@@ -1678,20 +1674,14 @@ ${comment !== '💬 Без комментария' ? `💬 **Причина от
           await ctx.reply(message, { reply_markup: keyboard, parse_mode: 'Markdown' });
           
           // Очищаем состояние
-          this.userStates.delete(chatId);
-          (this as any).selectedVoid.delete(chatId);
-          (this as any).userVoids.delete(chatId);
-          (this as any).userGroups.delete(chatId);
+          this.safeCleanupUserState(chatId);
           
           // Автоматически переходим на главную
           await this.onBackToMain(ctx);
         } catch (error) {
           console.error(`[${chatId}] Ошибка при отмене задачи:`, error);
           await ctx.reply('❌ Ошибка при отмене задачи. Попробуйте позже.');
-          this.userStates.delete(chatId);
-          (this as any).selectedVoid.delete(chatId);
-          (this as any).userVoids.delete(chatId);
-          (this as any).userGroups.delete(chatId);
+          this.safeCleanupUserState(chatId);
           
           // При ошибке переходим на главную
           await this.onBackToMain(ctx);
@@ -1729,20 +1719,14 @@ ${comment !== '💬 Без комментария' ? `💬 **Причина от
           await ctx.reply(message, { reply_markup: keyboard, parse_mode: 'Markdown' });
           
           // Очищаем состояние
-          this.userStates.delete(chatId);
-          (this as any).selectedPriceError.delete(chatId);
-          (this as any).userPriceErrors.delete(chatId);
-          (this as any).userGroups.delete(chatId);
+          this.safeCleanupUserState(chatId);
           
           // Автоматически переходим на главную
           await this.onBackToMain(ctx);
         } catch (error) {
           console.error(`[${chatId}] Ошибка при отмене задачи:`, error);
           await ctx.reply('❌ Ошибка при отмене задачи. Попробуйте позже.');
-          this.userStates.delete(chatId);
-          (this as any).selectedPriceError.delete(chatId);
-          (this as any).userPriceErrors.delete(chatId);
-          (this as any).userGroups.delete(chatId);
+          this.safeCleanupUserState(chatId);
           
           // При ошибке переходим на главную
           await this.onBackToMain(ctx);
@@ -2574,5 +2558,42 @@ ${error.details ? `📝 **Детали:** ${error.details}\n` : ''}
 
     // Устанавливаем правильное состояние
     this.userStates.set(chatId, 'price_error_action');
+  }
+
+  // Безопасная очистка состояния пользователя
+  private safeCleanupUserState(chatId: number) {
+    try {
+      // Очищаем основное состояние
+      this.userStates.delete(chatId);
+      
+      // Безопасно очищаем все возможные Map объекты
+      if ((this as any).selectedVoid?.has(chatId)) {
+        (this as any).selectedVoid.delete(chatId);
+      }
+      
+      if ((this as any).selectedPriceError?.has(chatId)) {
+        (this as any).selectedPriceError.delete(chatId);
+      }
+      
+      if ((this as any).userVoids?.has(chatId)) {
+        (this as any).userVoids.delete(chatId);
+      }
+      
+      if ((this as any).userPriceErrors?.has(chatId)) {
+        (this as any).userPriceErrors.delete(chatId);
+      }
+      
+      if ((this as any).userGroups?.has(chatId)) {
+        (this as any).userGroups.delete(chatId);
+      }
+      
+      if ((this as any).userErrorsByType?.has(chatId)) {
+        (this as any).userErrorsByType.delete(chatId);
+      }
+      
+      console.log(`[${chatId}] Состояние пользователя безопасно очищено`);
+    } catch (error) {
+      console.error(`[${chatId}] Ошибка при очистке состояния:`, error);
+    }
   }
 }
